@@ -50,3 +50,4 @@ resultApiKeyConfigured: true
 
 Manual run:
 GET https://<worker>.workers.dev/run?token=<RUN_TOKEN>
+Trigger Cloudflare Build
