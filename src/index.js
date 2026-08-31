@@ -174,6 +174,65 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function errorText(error) {
+  return String(
+    error?.message ||
+    error ||
+    "Unknown error"
+  );
+}
+
+function isBrowserRateLimit(error) {
+  const text = errorText(error).toLowerCase();
+
+  return (
+    text.includes("429") ||
+    text.includes("rate limit") ||
+    text.includes("too many")
+  );
+}
+
+async function launchBrowserWithRetry(env) {
+  const MAX_ATTEMPTS = 3;
+  const WAIT_MS = 25000;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      console.log(
+        `[BROWSER] launch attempt ${attempt}/${MAX_ATTEMPTS}`
+      );
+
+      const browser = await puppeteer.launch(
+        env.BROWSER
+      );
+
+      console.log("[BROWSER] launch OK");
+      return browser;
+    } catch (error) {
+      console.error(
+        `[BROWSER] launch failed attempt ${attempt}:`,
+        errorText(error)
+      );
+
+      if (
+        attempt < MAX_ATTEMPTS &&
+        isBrowserRateLimit(error)
+      ) {
+        console.warn(
+          `[BROWSER] rate limit detected, retry in ${WAIT_MS / 1000}s`
+        );
+
+        await sleep(WAIT_MS);
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw new Error("Browser launch gagal setelah retry.");
+}
+
 async function postRows(env, rows) {
   const baseUrl = String(
     env.THELASTMOON_URL || "https://thelastmoon.pages.dev"
@@ -190,6 +249,10 @@ async function postRows(env, rows) {
 
   for (let i = 0; i < rows.length; i += CHUNK) {
     const part = rows.slice(i, i + CHUNK);
+
+    console.log(
+      `[API] posting rows ${i + 1}-${Math.min(i + part.length, rows.length)} / ${rows.length}`
+    );
 
     const response = await fetch(
       `${baseUrl}/api/external/results`,
@@ -218,17 +281,241 @@ async function postRows(env, rows) {
     }
 
     saved += Number(data.saved || part.length);
+
+    console.log(
+      `[API] chunk OK • saved=${Number(data.saved || part.length)}`
+    );
   }
+
+  console.log(
+    `[API] all chunks OK • total saved=${saved}`
+  );
 
   return saved;
 }
 
-async function scanAllMarkets(env) {
+
+async function installNetworkCapture(page) {
+  await page.evaluate(() => {
+    window.__tlmNetwork = [];
+
+    if (window.__tlmCaptureInstalled) return;
+
+    window.__tlmCaptureInstalled = true;
+
+    const serializeBody = body => {
+      try {
+        if (body == null) return "";
+        if (typeof body === "string") return body.slice(0, 4000);
+        if (body instanceof URLSearchParams) return body.toString().slice(0, 4000);
+
+        if (typeof FormData !== "undefined" && body instanceof FormData) {
+          const params = new URLSearchParams();
+
+          for (const [key, value] of body.entries()) {
+            params.append(
+              key,
+              typeof value === "string"
+                ? value
+                : `[${value?.constructor?.name || "File"}]`
+            );
+          }
+
+          return params.toString().slice(0, 4000);
+        }
+
+        return String(body).slice(0, 4000);
+      } catch (_) {
+        return "";
+      }
+    };
+
+    const push = item => {
+      try {
+        window.__tlmNetwork.push({
+          at: Date.now(),
+          ...item
+        });
+
+        if (window.__tlmNetwork.length > 100) {
+          window.__tlmNetwork = window.__tlmNetwork.slice(-100);
+        }
+      } catch (_) {}
+    };
+
+    const originalFetch = window.fetch;
+
+    if (typeof originalFetch === "function") {
+      window.fetch = async function(input, init = {}) {
+        const requestUrl =
+          typeof input === "string"
+            ? input
+            : String(input?.url || "");
+
+        const method = String(
+          init?.method ||
+          input?.method ||
+          "GET"
+        ).toUpperCase();
+
+        const body = serializeBody(init?.body);
+        const started = Date.now();
+
+        try {
+          const response = await originalFetch.apply(this, arguments);
+          let preview = "";
+
+          try {
+            preview = (await response.clone().text()).slice(0, 2000);
+          } catch (_) {}
+
+          push({
+            transport: "fetch",
+            url: requestUrl,
+            method,
+            body,
+            status: response.status,
+            durationMs: Date.now() - started,
+            responsePreview: preview
+          });
+
+          return response;
+        } catch (error) {
+          push({
+            transport: "fetch",
+            url: requestUrl,
+            method,
+            body,
+            status: 0,
+            durationMs: Date.now() - started,
+            error: error?.message || String(error)
+          });
+
+          throw error;
+        }
+      };
+    }
+
+    const XHR = window.XMLHttpRequest;
+
+    if (XHR?.prototype) {
+      const originalOpen = XHR.prototype.open;
+      const originalSend = XHR.prototype.send;
+
+      XHR.prototype.open = function(method, url) {
+        this.__tlmMethod = String(method || "GET").toUpperCase();
+        this.__tlmUrl = String(url || "");
+        return originalOpen.apply(this, arguments);
+      };
+
+      XHR.prototype.send = function(body) {
+        const xhr = this;
+        const started = Date.now();
+        const sentBody = serializeBody(body);
+
+        xhr.addEventListener("loadend", () => {
+          let preview = "";
+
+          try {
+            if (typeof xhr.responseText === "string") {
+              preview = xhr.responseText.slice(0, 2000);
+            }
+          } catch (_) {}
+
+          push({
+            transport: "xhr",
+            url: xhr.__tlmUrl || "",
+            method: xhr.__tlmMethod || "GET",
+            body: sentBody,
+            status: Number(xhr.status || 0),
+            durationMs: Date.now() - started,
+            responsePreview: preview
+          });
+        }, { once: true });
+
+        return originalSend.apply(this, arguments);
+      };
+    }
+  });
+}
+
+async function clearNetworkCapture(page) {
+  await page.evaluate(() => {
+    window.__tlmNetwork = [];
+  });
+}
+
+async function readNetworkCapture(page) {
+  return page.evaluate(() =>
+    Array.isArray(window.__tlmNetwork)
+      ? window.__tlmNetwork.slice()
+      : []
+  );
+}
+
+function usefulNetworkEntries(entries, sourceUrl) {
+  let sourceOrigin = "";
+
+  try {
+    sourceOrigin = new URL(sourceUrl).origin;
+  } catch (_) {}
+
+  return (entries || [])
+    .map(item => {
+      let absoluteUrl = String(item?.url || "");
+
+      try {
+        absoluteUrl = new URL(
+          absoluteUrl,
+          sourceUrl
+        ).toString();
+      } catch (_) {}
+
+      return {
+        ...item,
+        url: absoluteUrl
+      };
+    })
+    .filter(item => {
+      const text = [
+        item.url || "",
+        item.body || "",
+        item.responsePreview || ""
+      ].join(" ").toLowerCase();
+
+      return (
+        (!sourceOrigin || String(item.url || "").startsWith(sourceOrigin)) &&
+        (
+          text.includes("history") ||
+          text.includes("number") ||
+          text.includes("result") ||
+          text.includes("pool")
+        )
+      );
+    })
+    .map(item => ({
+      transport: item.transport || "",
+      method: item.method || "GET",
+      url: item.url || "",
+      body: item.body || "",
+      status: Number(item.status || 0),
+      durationMs: Number(item.durationMs || 0),
+      responsePreview: String(
+        item.responsePreview || ""
+      ).slice(0, 1500),
+      error: item.error || ""
+    }));
+}
+
+async function captureAjaxTemplate(env) {
   const sourceUrl = String(
-    env.SOURCE_URL || "https://luna34849.com/history/number"
+    env.SOURCE_URL ||
+    "https://luna34849.com/history/number"
   ).trim();
 
-  const browser = await puppeteer.launch(env.BROWSER);
+  console.log("[CAPTURE] start");
+
+  const browser = await launchBrowserWithRetry(env);
 
   try {
     const page = await browser.newPage();
@@ -242,6 +529,227 @@ async function scanAllMarkets(env) {
       waitUntil: "networkidle2",
       timeout: 30000
     });
+
+    await page.waitForSelector("#pool-name", {
+      timeout: 15000
+    });
+
+    await page.waitForSelector("#isihistory", {
+      timeout: 15000
+    });
+
+    await installNetworkCapture(page);
+
+    const options = await page.evaluate(() => {
+      const select = document.querySelector("#pool-name");
+
+      return Array.from(select?.options || [])
+        .map((option, index) => ({
+          index,
+          name: String(
+            option.getAttribute("data-name") ||
+            option.textContent ||
+            ""
+          ).trim(),
+          code: String(
+            option.getAttribute("data-code") || ""
+          ).trim(),
+          value: String(option.value || "")
+        }))
+        .filter(item => item.name);
+    });
+
+    if (!options.length) {
+      throw new Error(
+        "Dropdown #pool-name tidak mempunyai option."
+      );
+    }
+
+    const preferred = [
+      "TOTOCAMBODIA",
+      "OREGON09",
+      "BANGKOK 0930"
+    ];
+
+    const selected = [];
+
+    for (const name of preferred) {
+      const found = options.find(item =>
+        norm(item.name) === norm(name)
+      );
+
+      if (found) selected.push(found);
+    }
+
+    for (const item of options) {
+      if (selected.length >= 3) break;
+
+      if (!selected.some(x => x.index === item.index)) {
+        selected.push(item);
+      }
+    }
+
+    const captures = [];
+
+    for (const item of selected.slice(0, 3)) {
+      const before = await page.evaluate(() => {
+        const box = document.querySelector("#isihistory");
+
+        return box
+          ? String(box.innerText || "")
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 1200)
+          : "";
+      });
+
+      await clearNetworkCapture(page);
+
+      await page.evaluate(payload => {
+        const select = document.querySelector("#pool-name");
+
+        if (!select) {
+          throw new Error("#pool-name hilang.");
+        }
+
+        select.selectedIndex = payload.index;
+
+        const option = select.options[payload.index];
+
+        if (option) option.selected = true;
+
+        let called = false;
+
+        try {
+          if (
+            payload.code &&
+            typeof window.changeHistory === "function"
+          ) {
+            window.changeHistory(payload.code);
+            called = true;
+          }
+        } catch (_) {}
+
+        if (!called) {
+          try {
+            if (typeof window.changeHistory === "function") {
+              window.changeHistory(select.value);
+              called = true;
+            }
+          } catch (_) {}
+        }
+
+        if (!called && window.jQuery) {
+          try {
+            window.jQuery(select)
+              .val(select.value)
+              .trigger("change");
+            called = true;
+          } catch (_) {}
+        }
+
+        if (!called) {
+          select.dispatchEvent(
+            new Event("change", {
+              bubbles: true
+            })
+          );
+        }
+      }, item);
+
+      try {
+        await page.waitForFunction(
+          previous => {
+            const box = document.querySelector("#isihistory");
+
+            const now = box
+              ? String(box.innerText || "")
+                  .replace(/\s+/g, " ")
+                  .trim()
+                  .slice(0, 1200)
+              : "";
+
+            return Boolean(now && now !== previous);
+          },
+          {
+            timeout: 3500
+          },
+          before
+        );
+      } catch (_) {
+        await sleep(700);
+      }
+
+      await sleep(350);
+
+      captures.push({
+        market: item.name,
+        code: item.code,
+        value: item.value,
+        network: usefulNetworkEntries(
+          await readNetworkCapture(page),
+          sourceUrl
+        ),
+        sampleRows: await page.evaluate(() => {
+          const table =
+            document.querySelector("#isihistory table") ||
+            document.querySelector("#isihistory");
+
+          if (!table) return [];
+
+          return Array.from(
+            table.querySelectorAll("tbody tr")
+          )
+            .slice(0, 3)
+            .map(tr =>
+              Array.from(tr.querySelectorAll("td"))
+                .map(td =>
+                  String(td.textContent || "")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                )
+            );
+        })
+      });
+    }
+
+    return {
+      ok: true,
+      version: "v2.3-ajax-capture",
+      sourceUrl,
+      optionCount: options.length,
+      testedMarkets: captures.length,
+      captures
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
+
+async function scanAllMarkets(env) {
+  const sourceUrl = String(
+    env.SOURCE_URL || "https://luna34849.com/history/number"
+  ).trim();
+
+  const browser = await launchBrowserWithRetry(env);
+
+  try {
+    const page = await browser.newPage();
+
+    await page.setViewport({
+      width: 1280,
+      height: 900
+    });
+
+    console.log(`[SCAN] open source: ${sourceUrl}`);
+
+    await page.goto(sourceUrl, {
+      waitUntil: "networkidle2",
+      timeout: 30000
+    });
+
+    console.log("[SCAN] source loaded");
 
     await page.waitForSelector("#pool-name", {
       timeout: 15000
@@ -280,9 +788,32 @@ async function scanAllMarkets(env) {
         .filter(item => allowed.has(normalize(item.name)));
     }, TARGETS);
 
+    console.log(
+      `[SCAN] ${options.length} target markets found`
+    );
+
+    if (!options.length) {
+      throw new Error(
+        "Tidak ada target market yang ditemukan di dropdown #pool-name."
+      );
+    }
+
     const all = [];
 
+    let marketIndex = 0;
+
     for (const item of options) {
+      marketIndex += 1;
+
+      if (
+        marketIndex === 1 ||
+        marketIndex % 10 === 0 ||
+        marketIndex === options.length
+      ) {
+        console.log(
+          `[SCAN] market ${marketIndex}/${options.length}: ${item.name}`
+        );
+      }
       const before = await page.evaluate(() => {
         const box = document.querySelector("#isihistory");
         return box
@@ -470,6 +1001,10 @@ async function scanAllMarkets(env) {
 
     const rows = Array.from(dedupe.values());
 
+    console.log(
+      `[SCAN] complete • markets=${options.length} • rows=${rows.length} • dates=${new Set(rows.map(row => row.date)).size}`
+    );
+
     const saved = await postRows(env, rows);
 
     return {
@@ -488,19 +1023,40 @@ async function scanAllMarkets(env) {
   }
 }
 
-async function run(env) {
+async function run(env, label = "manual") {
+  const startedAt = Date.now();
+
+  console.log(
+    `[${label.toUpperCase()}] START ${new Date(startedAt).toISOString()}`
+  );
+
   try {
     const result = await scanAllMarkets(env);
 
+    const durationMs = Date.now() - startedAt;
+
+    console.log(
+      `[${label.toUpperCase()}] SUCCESS • markets=${result.markets} • rows=${result.rows} • saved=${result.saved} • duration=${durationMs}ms`
+    );
+
     return Response.json({
-      version: "v2-browser-run",
-      ...result
+      version: "v2.3-ajax-capture",
+      ...result,
+      durationMs
     });
   } catch (error) {
+    const durationMs = Date.now() - startedAt;
+    const message = errorText(error);
+
+    console.error(
+      `[${label.toUpperCase()}] ERROR • duration=${durationMs}ms • ${message}`
+    );
+
     return Response.json({
       ok: false,
-      version: "v2-browser-run",
-      error: error?.message || String(error)
+      version: "v2.3-ajax-capture",
+      error: message,
+      durationMs
     }, {
       status: 500
     });
@@ -508,8 +1064,34 @@ async function run(env) {
 }
 
 export default {
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(run(env));
+  async scheduled(event, env, ctx) {
+    console.log(
+      `[CRON] trigger received • cron=${event?.cron || "unknown"} • scheduledTime=${event?.scheduledTime || Date.now()}`
+    );
+
+    ctx.waitUntil(
+      (async () => {
+        const response = await run(env, "cron");
+
+        if (!response.ok) {
+          const body = await response
+            .clone()
+            .text()
+            .catch(() => "");
+
+          console.error(
+            `[CRON] FAILED • ${body}`
+          );
+
+          // Reject waitUntil so Cloudflare marks the scheduled invocation as failed.
+          throw new Error(
+            body || "Cron result scan gagal."
+          );
+        }
+
+        console.log("[CRON] FINISHED OK");
+      })()
+    );
   },
 
   async fetch(request, env) {
@@ -518,15 +1100,55 @@ export default {
     if (url.pathname === "/health") {
       return Response.json({
         ok: true,
-        version: "v2-browser-run",
+        version: "v2.3-ajax-capture",
         browserBinding: Boolean(env.BROWSER),
         resultApiKeyConfigured: Boolean(
           String(env.RESULT_API_KEY || "").trim()
         ),
         sourceUrl:
           env.SOURCE_URL ||
-          "https://luna34849.com/history/number"
+          "https://luna34849.com/history/number",
+        cron: "*/10 * * * *",
+        retry429: true,
+        logsEnabledByConfig: true,
+        captureReady: true,
+        captureEndpoint: "/capture"
       });
+    }
+
+    if (url.pathname === "/capture") {
+      const supplied = String(
+        request.headers.get("X-Run-Token") ||
+        url.searchParams.get("token") ||
+        ""
+      );
+
+      const expected = String(
+        env.RUN_TOKEN || ""
+      );
+
+      if (!expected || supplied !== expected) {
+        return Response.json({
+          ok: false,
+          error: "RUN_TOKEN tidak valid."
+        }, {
+          status: 401
+        });
+      }
+
+      try {
+        return Response.json(
+          await captureAjaxTemplate(env)
+        );
+      } catch (error) {
+        return Response.json({
+          ok: false,
+          version: "v2.3-ajax-capture",
+          error: errorText(error)
+        }, {
+          status: 500
+        });
+      }
     }
 
     if (url.pathname === "/run") {
@@ -549,13 +1171,13 @@ export default {
         });
       }
 
-      return run(env);
+      return run(env, "manual");
     }
 
     return Response.json({
       ok: true,
       worker: "TheLastMoon Result Browser Worker",
-      version: "v2-browser-run",
+      version: "v2.3-ajax-capture",
       endpoints: ["/health", "/run"]
     });
   }
