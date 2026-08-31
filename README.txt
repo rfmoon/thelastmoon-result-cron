@@ -1,53 +1,47 @@
-THELASTMOON RESULT BROWSER WORKER V2.1 — GITHUB/WRANGLER DEPLOY
+THELASTMOON RESULT WORKER V2.3 — AJAX CAPTURE
 
-PENTING:
-JANGAN paste src/index.js langsung ke Cloudflare Dashboard editor.
-File ini mengimpor npm package:
-@cloudflare/puppeteer
+Tujuan:
+Menangkap request AJAX/XHR asli yang dipakai fungsi changeHistory()
+agar nanti scan rutin tidak perlu Browser Run.
 
-Package tersebut harus di-install/bundle oleh Wrangler atau Workers Builds.
+Cron sengaja dinonaktifkan sementara supaya kuota Browser Run tidak
+habis ketika fase capture.
 
-CARA PALING MUDAH:
-1. Buat GitHub repo baru, misalnya:
-   thelastmoon-result-cron
-2. Upload SEMUA isi folder ini ke root repo:
-   - package.json
-   - wrangler.toml
-   - src/index.js
-   - README.txt
-3. Cloudflare -> Worker "thelastmoon-result-cron"
-4. Settings -> Builds -> Connect
-5. Pilih repo GitHub tadi
-6. Deploy command:
-   npx wrangler deploy
-7. Setelah build sukses:
-   Settings -> Variables and Secrets
-8. Tambahkan SECRET:
-   RESULT_API_KEY
-   isi dengan API Extension Result BARU dari TheLastMoon
-9. Tambahkan SECRET:
-   RUN_TOKEN
-   isi token acak panjang buatan sendiri
+Update repo GitHub thelastmoon-result-cron dengan SEMUA isi ZIP ini:
+- package.json
+- wrangler.toml
+- README.txt
+- src/index.js
 
-Browser binding dan cron sudah ada di wrangler.toml:
-[browser]
-binding = "BROWSER"
+Commit ke main dan tunggu Cloudflare build sukses.
 
-[triggers]
-crons = ["*/10 * * * *"]
+Secret/binding tetap:
+- RESULT_API_KEY
+- RUN_TOKEN
+- BROWSER
 
-JANGAN menulis API key langsung di src/index.js.
+Cek:
+GET /health
 
-Jika API key pernah terlihat di screenshot/chat atau source code,
-REVOKE key lama di TheLastMoon dan Generate API Extension Result baru.
+Target:
+version: v2.3-ajax-capture
+captureReady: true
 
-TEST SETELAH DEPLOY:
-GET https://<worker>.workers.dev/health
+Lalu jalankan SEKALI:
+GET /capture?token=RUN_TOKEN_KAMU
 
-Harus:
-browserBinding: true
-resultApiKeyConfigured: true
+Worker akan mencoba:
+- TOTOCAMBODIA
+- OREGON09
+- BANGKOK 0930
 
-Manual run:
-GET https://<worker>.workers.dev/run?token=<RUN_TOKEN>
-Trigger Cloudflare Build
+dan mengembalikan request:
+- method
+- URL
+- body
+- HTTP status
+- response preview
+- sample rows
+
+Jangan kirim RUN_TOKEN ke chat.
+Kirim screenshot/JSON hasil /capture saja.

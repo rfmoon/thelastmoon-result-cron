@@ -10,8 +10,7 @@ binding = "BROWSER"
 THELASTMOON_URL = "https://thelastmoon.pages.dev"
 SOURCE_URL = "https://luna34849.com/history/number"
 
-[triggers]
-crons = ["*/10 * * * *"]
+# Cron sementara dinonaktifkan saat fase capture AJAX.
 
 [observability]
 enabled = true
